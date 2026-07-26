@@ -6,19 +6,20 @@ import json
 import logging
 import stat
 import time
+from collections.abc import AsyncGenerator, Generator
 from pathlib import Path, PurePosixPath
-from typing import AsyncGenerator, Awaitable, Callable
 from urllib.parse import quote
 
-import aiofiles
 import httpx
+import aiofiles
 
 from ._http import _HttpTransport
-from .download import download as _download
+from .download import _download
+from .download import _download_stream
 from .errors import BaiduPanNetworkError, TokenExpiredError
 from .models import ApiFileListItem, ApiFileMeta, ApiQuotaInfo, UploadResult
 from .upload import upload as _upload
-from .upload import UploadSource, _is_async_generator, _is_generator
+from .upload import _is_async_generator, _is_generator
 
 logger = logging.getLogger("abdds")
 
@@ -32,13 +33,13 @@ class AsyncBaiduPanClient:
     Usage::
 
         async with AsyncBaiduPanClient(client_id, client_secret, app_name) as client:
-            if not client.access_token:
+            if not client.is_authenticated:
                 print(client.auth_url)
                 code = input("Enter code: ")
                 await client.fetch_token(code)
 
-            quota = await client.get_quota()
-            result = await client.upload(Path("local_file.txt"))
+            q = await client.quota()
+            result = await client.upload(Path("local_file.txt"), remote_path="/docs/file.txt")
     """
 
     HOST_OAUTH = "https://openapi.baidu.com/oauth/2.0"
@@ -53,6 +54,7 @@ class AsyncBaiduPanClient:
         client_id: str,
         client_secret: str,
         app_name: str,
+        *,
         config_dir: Path | None = None,
         max_retries: int = 3,
         timeout: tuple[int, int] | None = None,
@@ -70,13 +72,13 @@ class AsyncBaiduPanClient:
         """
         self._client_id = client_id
         self._client_secret = client_secret
-        self.app_name = app_name
-        self.pan_dir_base = f"/apps/{app_name}"
+        self._app_name = app_name
+        self._app_dir = f"/apps/{app_name}"
 
         if config_dir is None:
             config_dir = Path.home() / ".baidupan"
-        self.config_dir = config_dir
-        self._token_file = self.config_dir / f"access_token_{client_id}.json"
+        self._config_dir = config_dir
+        self._token_file = self._config_dir / f"access_token_{client_id}.json"
 
         self._token_data: dict = {}
         self._access_token: str | None = None
@@ -91,7 +93,7 @@ class AsyncBaiduPanClient:
 
         # 注意: _load_token 是异步方法，不能在 __init__ 中直接调用
         # 需要用户在初始化后手动调用 await client._load_token()
-        # 或者使用 create 类方法
+        # 或者使用 create 类方法 / async with 上下文
 
     @classmethod
     async def create(
@@ -99,14 +101,19 @@ class AsyncBaiduPanClient:
         client_id: str,
         client_secret: str,
         app_name: str,
+        *,
         config_dir: Path | None = None,
         max_retries: int = 3,
         timeout: tuple[int, int] | None = None,
     ) -> AsyncBaiduPanClient:
         """异步工厂方法，初始化客户端并自动加载已保存的 Token"""
-        instance = cls(client_id, client_secret, app_name, config_dir, max_retries, timeout)
+        instance = cls(client_id, client_secret, app_name, config_dir=config_dir, max_retries=max_retries, timeout=timeout)
         await instance._load_token()
         return instance
+
+    def __repr__(self) -> str:
+        auth = "authenticated" if self._access_token else "not authenticated"
+        return f"AsyncBaiduPanClient(app={self._app_name!r}, {auth})"
 
     # ---- 上下文管理器 ----
 
@@ -126,7 +133,12 @@ class AsyncBaiduPanClient:
         await self.close()
         return False
 
-    # ---- Token 管理 ----
+    # ---- 认证 ----
+
+    @property
+    def is_authenticated(self) -> bool:
+        """是否已认证"""
+        return self._access_token is not None
 
     @property
     def access_token(self) -> str | None:
@@ -163,7 +175,6 @@ class AsyncBaiduPanClient:
         except httpx.RequestError as e:
             raise BaiduPanNetworkError(f"Fetch token failed: {e}") from e
 
-        # 检查 API 层面错误
         if "error" in result:
             raise TokenExpiredError(
                 f"Fetch token failed: {result.get('error_description', result['error'])}"
@@ -197,7 +208,6 @@ class AsyncBaiduPanClient:
         except httpx.RequestError as e:
             raise BaiduPanNetworkError(f"Refresh token failed: {e}") from e
 
-        # 检查 API 层面错误
         if "error" in result:
             raise TokenExpiredError(
                 f"Refresh token failed: {result.get('error_description', result['error'])}"
@@ -234,7 +244,7 @@ class AsyncBaiduPanClient:
             error_desc = data.get("error_description", data.get("Error", "Unknown error"))
             raise TokenExpiredError(f"Token response missing access_token: {error_desc}")
 
-        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self._config_dir.mkdir(parents=True, exist_ok=True)
         data["update_at"] = int(time.time())
         self._token_data = data
         self._access_token = data["access_token"]
@@ -251,9 +261,9 @@ class AsyncBaiduPanClient:
 
         logger.info("Access token saved")
 
-    # ---- 业务 API ----
+    # ---- 网盘信息 ----
 
-    async def get_quota(self) -> ApiQuotaInfo:
+    async def quota(self) -> ApiQuotaInfo:
         """
         获取网盘空间配额
 
@@ -262,9 +272,36 @@ class AsyncBaiduPanClient:
         data = await self._transport.request("GET", self.URL_QUOTA)
         return ApiQuotaInfo(total=data.get("total", 0), used=data.get("used", 0))
 
-    async def get_file_metas(self, fsids: list[int]) -> list[ApiFileMeta]:
+    # ---- 文件操作 ----
+
+    async def list_files(self, path: str = "/") -> list[ApiFileListItem]:
         """
-        获取文件元信息
+        获取指定目录下的文件列表
+
+        https://pan.baidu.com/union/doc/nksg0sat9
+
+        Args:
+            path: 目录路径
+        """
+        params = {"method": "list", "dir": quote(path)}
+        data = await self._transport.request("GET", self.URL_FILE, params=params)
+        items = data.get("list", [])
+
+        return [
+            ApiFileListItem(
+                fs_id=item["fs_id"],
+                filename=item["server_filename"],
+                path=item["path"],
+                size=item["size"],
+                md5=item.get("md5", ""),
+                is_dir=item.get("isdir", 0),
+            )
+            for item in items
+        ]
+
+    async def file_metas(self, fsids: list[int]) -> list[ApiFileMeta]:
+        """
+        获取文件元信息（含下载链接 dlink）
 
         https://pan.baidu.com/union/doc/Fksg0sbcm
 
@@ -290,53 +327,28 @@ class AsyncBaiduPanClient:
             for item in items
         ]
 
-    async def get_file_list(self, path: str) -> list[ApiFileListItem]:
-        """
-        获取指定目录下的文件列表
-
-        https://pan.baidu.com/union/doc/nksg0sat9
-
-        Args:
-            path: 目录路径
-        """
-        params = {"method": "list", "dir": quote(path)}
-        data = await self._transport.request("GET", self.URL_FILE, params=params)
-        items = data.get("list", [])
-
-        return [
-            ApiFileListItem(
-                fs_id=item["fs_id"],
-                filename=item["server_filename"],
-                path=item["path"],
-                size=item["size"],
-                md5=item.get("md5", ""),
-                is_dir=item.get("isdir", 0),
-            )
-            for item in items
-        ]
-
-    async def delete_files(self, file_paths: list[str]) -> None:
+    async def delete(self, paths: list[str]) -> None:
         """
         批量删除文件
 
         https://pan.baidu.com/union/doc/mksg0s9l4
 
         Args:
-            file_paths: 要删除的文件路径列表
+            paths: 要删除的文件路径列表
         """
-        if not file_paths:
+        if not paths:
             return
         params = {"method": "filemanager", "opera": "delete"}
-        data = {"async": 2, "filelist": json.dumps(file_paths)}
+        data = {"async": 2, "filelist": json.dumps(paths)}
         await self._transport.request("POST", self.URL_FILE, params=params, data=data)
-        logger.info("Deleted %d file(s)", len(file_paths))
+        logger.info("Deleted %d file(s)", len(paths))
 
     # ---- 上传 ----
 
     async def upload(
         self,
-        file_from: UploadSource,
-        file_to: Path | None = None,
+        source: Path | bytes | Generator[bytes, None, None] | AsyncGenerator[bytes, None],
+        remote_path: str = "",
     ) -> UploadResult:
         """
         异步上传数据到百度网盘
@@ -345,75 +357,120 @@ class AsyncBaiduPanClient:
         - 大文件 (>4MB): 分片上传
 
         Args:
-            file_from: 数据来源，支持 Path / bytes / Generator[bytes] / AsyncGenerator[bytes]
-            file_to: 远程路径 (Path)，拼接在 /apps/{app_name} 之后。
-                默认使用 file_from 的文件名 (Path 时) 或 "upload"
+            source: 数据来源，支持 Path / bytes / Generator[bytes] / AsyncGenerator[bytes]
+            remote_path: 远程路径 (如 "/docs/file.txt")，将拼接在 /apps/{app_name} 之后。
+                为空时，Path 使用源文件名，其他类型使用 "upload"
 
         Returns:
             UploadResult: 上传结果
 
         Raises:
-            TypeError: file_from 或 file_to 类型不正确
+            TypeError: source 类型不正确
         """
-        # 类型校验
         if (
-            not isinstance(file_from, (Path, bytes))
-            and not _is_generator(file_from)
-            and not _is_async_generator(file_from)
+            not isinstance(source, (Path, bytes))
+            and not _is_generator(source)
+            and not _is_async_generator(source)
         ):
             raise TypeError(
-                f"file_from must be Path, bytes, Generator[bytes], or AsyncGenerator[bytes], "
-                f"got {type(file_from).__name__}"
-            )
-        if file_to is not None and not isinstance(file_to, Path):
-            raise TypeError(
-                f"file_to must be Path or None, got {type(file_to).__name__}"
+                f"source must be Path, bytes, Generator[bytes], or AsyncGenerator[bytes], "
+                f"got {type(source).__name__}"
             )
 
-        if isinstance(file_from, Path):
-            default_name = file_from.name
-        else:
-            default_name = "upload"
+        # 确定远程文件名
+        if not remote_path:
+            if isinstance(source, Path):
+                remote_path = f"/{source.name}"
+            else:
+                remote_path = "/upload"
 
-        if file_to is None:
-            remote_path = PurePosixPath(f"/{default_name}")
-        else:
-            # 将 Path 转为 PurePosixPath 以确保 POSIX 风格
-            remote_path = PurePosixPath(file_to.as_posix())
-            if not remote_path.is_absolute():
-                remote_path = PurePosixPath(f"/{remote_path}")
+        # 规范化为绝对 POSIX 路径
+        posix_path = PurePosixPath(remote_path)
+        if not posix_path.is_absolute():
+            posix_path = PurePosixPath(f"/{posix_path}")
 
-        return await _upload(self._transport, file_from, remote_path, self.pan_dir_base)
+        return await _upload(self._transport, source, posix_path, self._app_dir)
 
     # ---- 下载 ----
 
-    async def download(
+    async def download_to_file(
         self,
         dlink: str,
-        file_to: Path | None = None,
+        local_path: Path,
+        *,
         chunk_size: int = 1024 * 1024,
-    ) -> AsyncGenerator[bytes, None] | Path:
+    ) -> Path:
         """
-        异步下载文件
-
-        - file_to=None: 返回异步字节迭代器 (流式下载)
-        - file_to=Path: 下载到本地文件，返回 Path
+        下载文件到本地路径
 
         https://pan.baidu.com/union/doc/pkuo3snyp
 
         Args:
-            dlink: 下载链接 (通过 get_file_metas 获取)
-            file_to: 本地保存路径 (Path)，为 None 时返回迭代器
+            dlink: 下载链接 (通过 file_metas 获取)
+            local_path: 本地保存路径
             chunk_size: 分块大小，默认 1MB
 
         Returns:
-            AsyncGenerator[bytes] 当 file_to=None，Path 当 file_to 指定路径
+            下载完成的本地路径
 
         Raises:
-            TypeError: file_to 类型不正确
+            TypeError: local_path 类型不正确
         """
-        if file_to is not None and not isinstance(file_to, Path):
+        if not isinstance(local_path, Path):
             raise TypeError(
-                f"file_to must be Path or None, got {type(file_to).__name__}"
+                f"local_path must be Path, got {type(local_path).__name__}"
             )
-        return await _download(self._transport, dlink, file_to, chunk_size)
+        result = await _download(self._transport, dlink, local_path, chunk_size)
+        assert isinstance(result, Path)
+        return result
+
+    async def download_stream(
+        self,
+        dlink: str,
+        *,
+        chunk_size: int = 1024 * 1024,
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        异步流式下载文件，返回异步字节迭代器
+
+        https://pan.baidu.com/union/doc/pkuo3snyp
+
+        Args:
+            dlink: 下载链接 (通过 file_metas 获取)
+            chunk_size: 分块大小，默认 1MB
+
+        Yields:
+            bytes: 数据块
+        """
+        result = await _download(self._transport, dlink, None, chunk_size)
+        assert isinstance(result, AsyncGenerator)
+        async for chunk in result:
+            yield chunk
+
+    async def download_stream_with_range(
+        self,
+        dlink: str,
+        range: tuple[int | None, int | None],
+        *,
+        chunk_size: int = 1024 * 1024,
+        max_retries: int = 5,
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        带断点续传的异步流式下载
+
+        Args:
+            dlink: 下载链接 (通过 file_metas 获取)
+            range: 下载范围 (start, end)，None 表示不限制。
+                (500, None) → 从 500 到末尾
+                (0, 499)    → 前 500 字节
+                (None, 500) → 最后 500 字节
+            chunk_size: 分块大小，默认 1MB
+            max_retries: 最大重试次数，默认 5
+
+        Yields:
+            bytes: 数据块
+        """
+        async for chunk in _download_stream(
+            self._transport, dlink, chunk_size, max_retries, range
+        ):
+            yield chunk

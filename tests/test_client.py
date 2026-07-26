@@ -17,8 +17,9 @@ from abdds.models import ApiFileListItem, ApiFileMeta, ApiQuotaInfo
 class TestClientInit:
     def test_basic_init(self, tmp_config_dir: Path):
         client = AsyncBaiduPanClient("id", "secret", "myapp", config_dir=tmp_config_dir)
-        assert client.pan_dir_base == "/apps/myapp"
+        assert client._app_dir == "/apps/myapp"
         assert client.access_token is None
+        assert not client.is_authenticated
 
     async def test_context_manager(self, tmp_config_dir: Path):
         async with AsyncBaiduPanClient("id", "secret", "myapp", config_dir=tmp_config_dir) as client:
@@ -31,6 +32,14 @@ class TestClientInit:
         url = client.auth_url
         assert "my_client_id" in url
         assert "authorize" in url
+
+    def test_repr(self, tmp_config_dir: Path):
+        client = AsyncBaiduPanClient("id", "secret", "myapp", config_dir=tmp_config_dir)
+        assert "myapp" in repr(client)
+        assert "not authenticated" in repr(client)
+
+        client._access_token = "token"
+        assert "authenticated" in repr(client)
 
 
 class TestTokenManagement:
@@ -48,6 +57,7 @@ class TestTokenManagement:
         await client.fetch_token("auth_code_123")
 
         assert client.access_token == "new_access"
+        assert client.is_authenticated
         assert client._refresh_token == "new_refresh"
 
         # token 文件应已创建
@@ -98,22 +108,23 @@ class TestTokenManagement:
         client = AsyncBaiduPanClient("id", "secret", "app", config_dir=tmp_config_dir)
         await client._load_token()
         assert client.access_token == "loaded_access"
+        assert client.is_authenticated
 
 
 class TestBusinessAPI:
     @respx.mock
-    async def test_get_quota(self, mock_client: AsyncBaiduPanClient):
+    async def test_quota(self, mock_client: AsyncBaiduPanClient):
         respx.get("https://pan.baidu.com/api/quota").mock(
             return_value=httpx.Response(200, json={"errno": 0, "total": 214748364800, "used": 1073741824})
         )
 
-        quota = await mock_client.get_quota()
+        quota = await mock_client.quota()
         assert isinstance(quota, ApiQuotaInfo)
         assert quota.total == 214748364800
         assert quota.used == 1073741824
 
     @respx.mock
-    async def test_get_file_metas(self, mock_client: AsyncBaiduPanClient):
+    async def test_file_metas(self, mock_client: AsyncBaiduPanClient):
         respx.get("https://pan.baidu.com/rest/2.0/xpan/multimedia").mock(
             return_value=httpx.Response(200, json={
                 "errno": 0,
@@ -130,18 +141,18 @@ class TestBusinessAPI:
             })
         )
 
-        metas = await mock_client.get_file_metas([123])
+        metas = await mock_client.file_metas([123])
         assert len(metas) == 1
         assert isinstance(metas[0], ApiFileMeta)
         assert metas[0].fs_id == 123
         assert metas[0].dlink == "https://dlink.example.com/f"
 
-    async def test_get_file_metas_empty_fsids(self, mock_client: AsyncBaiduPanClient):
-        result = await mock_client.get_file_metas([])
+    async def test_file_metas_empty_fsids(self, mock_client: AsyncBaiduPanClient):
+        result = await mock_client.file_metas([])
         assert result == []
 
     @respx.mock
-    async def test_get_file_list(self, mock_client: AsyncBaiduPanClient):
+    async def test_list_files(self, mock_client: AsyncBaiduPanClient):
         respx.get("https://pan.baidu.com/rest/2.0/xpan/file").mock(
             return_value=httpx.Response(200, json={
                 "errno": 0,
@@ -166,24 +177,24 @@ class TestBusinessAPI:
             })
         )
 
-        items = await mock_client.get_file_list("/apps/test/")
+        items = await mock_client.list_files("/apps/test/")
         assert len(items) == 2
         assert isinstance(items[0], ApiFileListItem)
         assert items[0].is_dir == 1
         assert items[1].filename == "file.txt"
 
     @respx.mock
-    async def test_delete_files(self, mock_client: AsyncBaiduPanClient):
+    async def test_delete(self, mock_client: AsyncBaiduPanClient):
         route = respx.post("https://pan.baidu.com/rest/2.0/xpan/file").mock(
             return_value=httpx.Response(200, json={"errno": 0})
         )
 
-        await mock_client.delete_files(["/apps/test/f.txt"])
+        await mock_client.delete(["/apps/test/f.txt"])
         assert route.called
 
-    async def test_delete_files_empty_list(self, mock_client: AsyncBaiduPanClient):
+    async def test_delete_empty_list(self, mock_client: AsyncBaiduPanClient):
         # 空列表不应发起请求
-        await mock_client.delete_files([])
+        await mock_client.delete([])
 
     @respx.mock
     async def test_no_token_raises(self, tmp_config_dir: Path):
@@ -193,7 +204,7 @@ class TestBusinessAPI:
 
         client = AsyncBaiduPanClient("id", "secret", "app", config_dir=tmp_config_dir)
         with pytest.raises(TokenExpiredError):
-            await client.get_quota()
+            await client.quota()
 
 
 class TestTokenEdgeCases:
@@ -238,17 +249,12 @@ class TestTokenEdgeCases:
 
 
 class TestUploadDownloadEdgeCases:
-    async def test_upload_file_from_type_error(self, mock_client: AsyncBaiduPanClient):
-        """file_from 传入 str 应抛 TypeError"""
-        with pytest.raises(TypeError, match="file_from must be"):
+    async def test_upload_source_type_error(self, mock_client: AsyncBaiduPanClient):
+        """source 传入 str 应抛 TypeError"""
+        with pytest.raises(TypeError, match="source must be"):
             await mock_client.upload("not_a_path")  # type: ignore
 
-    async def test_upload_file_to_type_error(self, mock_client: AsyncBaiduPanClient):
-        """file_to 传入 str 应抛 TypeError"""
-        with pytest.raises(TypeError, match="file_to must be"):
-            await mock_client.upload(Path("f.txt"), file_to="/str_path")  # type: ignore
-
-    async def test_download_file_to_type_error(self, mock_client: AsyncBaiduPanClient):
-        """download file_to 传入 str 应抛 TypeError"""
-        with pytest.raises(TypeError, match="file_to must be"):
-            await mock_client.download("https://dlink", file_to="/str_path")  # type: ignore
+    async def test_download_to_file_type_error(self, mock_client: AsyncBaiduPanClient):
+        """download_to_file local_path 传入 str 应抛 TypeError"""
+        with pytest.raises(TypeError, match="local_path must be Path"):
+            await mock_client.download_to_file("https://dlink", "/str_path")  # type: ignore

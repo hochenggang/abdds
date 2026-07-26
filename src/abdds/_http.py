@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 
@@ -12,7 +13,7 @@ from .errors import BaiduPanAPIError, BaiduPanNetworkError, TokenExpiredError
 
 logger = logging.getLogger("abdds")
 
-UserAgent = "netdisk;2.2.51.6;netdisk;10.0;PC;PC;Mac OS X 10.15.7;en-US"
+_USER_AGENT = "netdisk;2.2.51.6;netdisk;10.0;PC;PC;Mac OS X 10.15.7;en-US"
 
 
 def _truncate_data(data: Any, max_len: int = 500) -> Any:
@@ -50,7 +51,7 @@ class _HttpTransport:
         client = httpx.AsyncClient(
             transport=transport,
             timeout=httpx.Timeout(self._timeout[1], connect=self._timeout[0]),
-            headers={"User-Agent": UserAgent},
+            headers={"User-Agent": _USER_AGENT},
             follow_redirects=True,
         )
         return client

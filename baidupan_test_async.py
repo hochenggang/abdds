@@ -78,7 +78,7 @@ async def run_integration_test():
         remote_path = None
 
         # 确保登录
-        if not client.access_token:
+        if not client.is_authenticated:
             print(f"\n>>> 请在浏览器打开: {client.auth_url}")
             code = input(">>> 请输入授权码 (Code): ").strip()
             await client.fetch_token(code)
@@ -97,7 +97,7 @@ async def run_integration_test():
             # Step 2: 上传文件
             logger.info("\n=== STEP 2: 执行上传 ===")
             start_t = time.time()
-            upload_res = await client.upload(source_path, file_to=Path("/test_source_7mb.bin"))
+            upload_res = await client.upload(source_path, remote_path="/test_source_7mb.bin")
             upload_time = time.time() - start_t
 
             remote_path = upload_res.path
@@ -106,11 +106,11 @@ async def run_integration_test():
 
             # Step 3: 下载文件
             logger.info("\n=== STEP 3: 执行下载 ===")
-            metas = await client.get_file_metas([upload_res.fs_id])
+            metas = await client.file_metas([upload_res.fs_id])
             dlink = metas[0].dlink
 
             start_t = time.time()
-            await client.download(dlink, file_to=download_path)
+            await client.download_to_file(dlink, download_path)
             download_time = time.time() - start_t
             logger.info(f"下载完成! 耗时: {download_time:.2f}s")
 
@@ -135,7 +135,7 @@ async def run_integration_test():
             logger.info("\n=== STEP 5: 清理环境 ===")
             if remote_path:
                 try:
-                    await client.delete_files([remote_path])
+                    await client.delete([remote_path])
                     logger.info(f"已删除远端文件: {remote_path}")
                 except Exception as e:
                     logger.warning(f"删除远端文件失败: {e}")

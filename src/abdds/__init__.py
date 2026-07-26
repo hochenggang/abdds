@@ -4,12 +4,18 @@
 
 Usage::
 
+    from pathlib import Path
     from abdds import AsyncBaiduPanClient
 
     async with AsyncBaiduPanClient(client_id, client_secret, app_name) as client:
-        quota = await client.get_quota()
-        await client.upload(Path("file.txt"), file_to=Path("/docs/file.txt"))
-        await client.download(dlink, file_to=Path("output.txt"))
+        if not client.is_authenticated:
+            print(client.auth_url)
+            code = input("Enter code: ")
+            await client.fetch_token(code)
+
+        q = await client.quota()
+        result = await client.upload(Path("file.txt"), remote_path="/docs/file.txt")
+        await client.download_to_file(dlink, Path("output.txt"))
 """
 
 __version__ = "0.1.0"

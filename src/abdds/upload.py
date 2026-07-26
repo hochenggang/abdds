@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import io
 import json
 import logging
@@ -147,11 +146,6 @@ async def upload(
             raise ValueError("Cannot upload empty generator (0 bytes yielded)")
 
         file_from = (chunk for chunk in chunks2)
-    else:
-        raise TypeError(
-            f"file_from must be Path, bytes, Generator[bytes], or AsyncGenerator[bytes], "
-            f"got {type(file_from).__name__}"
-        )
 
     logger.info("Uploading -> %s (%d bytes)", remote_path, file_size)
 
@@ -190,8 +184,6 @@ async def _upload_small(
         data = b"".join(chunks)
     elif _is_generator(file_from):
         data = b"".join(file_from)
-    else:
-        data = b""
 
     files = {"file": ("blob", data)}
     resp = await transport.request("POST", url, params=params, files=files)
